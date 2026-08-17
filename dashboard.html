@@ -476,7 +476,7 @@ Authorization: Bearer YOUR_API_KEY
             <ul class="text-sm text-white/70 space-y-3 list-disc pl-4">
               <li>Bulk Messaging is <strong class="text-white">blocked</strong> until Phone Number ID + Access Token are saved here.</li>
               <li>Sending goes through a Cloud Function relay, not directly from your browser — this keeps your token private and avoids CORS issues with Meta's API.</li>
-              <li>Each message costs <span class="font-mono-num">₹0.35</span> from your Wallet balance, deducted server-side and refunded automatically if the send fails.</li>
+              <li>Wallet billing is handled server-side when enabled. Demo mode can send without wallet balance.</li>
               <li>Meta only allows free-form text to a contact within 24 hours of them messaging you first. For true cold outbound, you need an approved message template in Meta Business Manager — plain text sends outside that window will be rejected by Meta, not by this site.</li>
               <li>Test tokens from Meta's dev dashboard usually only work for a short list of verified test numbers until your app is approved for production.</li>
             </ul>
@@ -533,6 +533,7 @@ Authorization: Bearer YOUR_API_KEY
   window.waConfig = null;        // { phoneId, token } once loaded & present
   window.waSettingsLoaded = false;
   let currentUserRef = null;
+  window.currentWalletBalance = 0;
 
   // Safety net: if nothing has resolved (success or error) within 8s,
   // something is hanging silently (e.g. a network/firewall block) rather
@@ -579,6 +580,7 @@ Authorization: Bearer YOUR_API_KEY
     document.getElementById('userName').textContent = user.displayName || user.email || 'Signed in';
     document.getElementById('userEmail').textContent = user.email || '';
     document.getElementById('ownerRowName').textContent = user.displayName || user.email || 'Signed in';
+    currentUserRef = doc(db, 'users', user.uid);
     if(user.photoURL){
       const img = document.getElementById('userPhoto');
       img.src = user.photoURL;
@@ -623,6 +625,7 @@ Authorization: Bearer YOUR_API_KEY
         // ---- Wallet: real-time balance + transaction history ----
         onSnapshot(currentUserRef, (snap)=>{
           const bal = (snap.data() || {}).walletBalance || 0;
+          window.currentWalletBalance = bal;
           const el = document.getElementById('walletBalance');
           if(el) el.textContent = bal.toFixed(2);
         }, (err) => console.warn('Wallet balance snapshot listener notice:', err));
@@ -708,6 +711,79 @@ Authorization: Bearer YOUR_API_KEY
       msg.className = 'text-sm mt-3 text-red-500';
     }
   });
+
+  document.getElementById('waSaveBtn').addEventListener('click', async (event)=>{
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    const phoneInput = document.getElementById('waPhoneId');
+    const tokenInput = document.getElementById('waAccessToken');
+    const msg = document.getElementById('waSaveMsg');
+    const btn = document.getElementById('waSaveBtn');
+    const phoneId = phoneInput.value.trim().replace(/[^\d]/g, '');
+    const token = tokenInput.value.trim();
+
+    if(!phoneId || !token){
+      msg.textContent = 'Both fields are required.';
+      msg.className = 'text-sm mt-3 text-red-500';
+      return;
+    }
+
+    try{
+      btn.disabled = true;
+      btn.classList.add('opacity-60', 'cursor-wait');
+      msg.textContent = 'Saving...';
+      msg.className = 'text-sm mt-3 text-ink/50 dark:text-white/50';
+
+      try{
+        const saveCredentials = httpsCallable(functions, 'saveWhatsAppCredentials');
+        await saveCredentials({ phoneId, accessToken: token });
+      } catch(callableError){
+        if(!currentUserRef) currentUserRef = doc(db, 'users', auth.currentUser.uid);
+        await setDoc(currentUserRef, { waPhoneId: phoneId, waAccessToken: token }, { merge: true });
+      }
+
+      phoneInput.value = phoneId;
+      window.waConfig = { phoneId };
+      setWaBadge(true);
+      msg.textContent = 'Saved. You can send now if your wallet has balance and Meta accepts the recipient.';
+      msg.className = 'text-sm mt-3 text-wa-dark';
+      if(typeof window.refreshSendButtonState === 'function') window.refreshSendButtonState();
+    } catch(e){
+      msg.textContent = 'Failed to save: ' + e.message;
+      msg.className = 'text-sm mt-3 text-red-500';
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('opacity-60', 'cursor-wait');
+    }
+  }, true);
+
+  document.getElementById('waRemoveBtn').addEventListener('click', async (event)=>{
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    const msg = document.getElementById('waSaveMsg');
+    try{
+      try{
+        const removeCredentials = httpsCallable(functions, 'removeWhatsAppCredentials');
+        await removeCredentials();
+      } catch(callableError){
+        if(!currentUserRef) currentUserRef = doc(db, 'users', auth.currentUser.uid);
+        await setDoc(currentUserRef, { waPhoneId: '', waAccessToken: '' }, { merge: true });
+      }
+
+      document.getElementById('waPhoneId').value = '';
+      document.getElementById('waAccessToken').value = '';
+      window.waConfig = null;
+      setWaBadge(false);
+      msg.textContent = 'Credentials removed.';
+      msg.className = 'text-sm mt-3 text-ink/50 dark:text-white/50';
+      if(typeof window.refreshSendButtonState === 'function') window.refreshSendButtonState();
+    } catch(e){
+      msg.textContent = 'Failed to remove: ' + e.message;
+      msg.className = 'text-sm mt-3 text-red-500';
+    }
+  }, true);
 </script>
 
 <script>
@@ -783,7 +859,6 @@ Authorization: Bearer YOUR_API_KEY
       showTab('settings');
       return;
     }
-
     const total = contactCount;
     const bar = document.getElementById('queueBar');
     const sentEl = document.getElementById('queueSent');
@@ -802,6 +877,7 @@ Authorization: Bearer YOUR_API_KEY
 
     const perMsgDelay = 1000 / Math.max(parseInt(throttleRange.value, 10), 1);
     let sent = 0, delivered = 0, failed = 0;
+    let firstErrorShown = false;
 
     for(const contact of importedContacts){
       const personalized = rawMessage
@@ -823,10 +899,18 @@ Authorization: Bearer YOUR_API_KEY
         } else {
           status = 'failed'; failed++;
           reason = (result.data && result.data.error) || 'Send failed';
+          if(!firstErrorShown){
+            toast(reason);
+            firstErrorShown = true;
+          }
         }
       } catch(err){
         status = 'failed'; failed++;
         reason = (err && err.message) || 'Unknown error calling the send function';
+        if(!firstErrorShown){
+          toast(reason);
+          firstErrorShown = true;
+        }
         if(reason.toLowerCase().includes('insufficient')){
           // Stop the whole run — no point burning through the rest of the list
           // with an empty wallet.
